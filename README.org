@@ -1,0 +1,5 @@
+* LP-Programming CPPM
+This is the reusable / portable portions of C++ 26 modules I use. Anything that isn't entirely application specific
+lives here. 
+
+
