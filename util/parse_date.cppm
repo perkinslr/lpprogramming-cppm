@@ -1,0 +1,319 @@
+// Module Declaration and Imports
+
+export module parse_date;
+import <chrono>;
+import <string>;
+import <array>;
+import <ranges>;
+import <algorithm>;
+import <format>;
+import <type_traits>;
+
+import Subprocess;
+import parse_int;
+import static_for;
+
+using namespace std::chrono;
+using namespace lpprogramming;
+
+// Internal Data Structures
+// We use an intermediate local struct to hold the parsed pieces. The simple parser needs all the accessed fields to be of
+// the same type, and micros can be up to 6 digits, so that means using 32bits each. This is used during program start,
+// and when reading values from sql. It isn't used by the live code, so keeping it simple matters more than squeezing every
+// bit of performance out of it.
+
+namespace {
+  struct time {
+    int32_t year;
+    int32_t month;
+    int32_t day;
+    int32_t hour;
+    int32_t minute;
+    int32_t second;
+    int32_t micro;
+    minutes timezone;
+  };
+
+  struct time_field {
+    int32_t time::* field;
+    std::string separator;
+    int32_t length;
+    bool right = false;
+  };
+}
+
+export
+namespace lpprogramming::util {
+
+// External Timezone Lookup via ~date~ Command
+// Clang doesn't have proper timezone handling yet. We could fall back on libc to figure out our time offset, but we need
+// to be able to lookup timezone offsets for arbitrary dates and that isn't entirely trivial. I hate daylight savings.
+// POSIX ~date~ just takes care of it for us, though it does tie us to POSIX environments.
+
+
+
+
+  // Executes `date -d '<stamp>' +%z` to retrieve local timezone offset
+  // Returns string like "+0200". Throws on failure.
+  // If called at compiletime, returns zulu time.
+  constexpr std::string get_timezone(const std::string stamp) {
+
+    if (std::is_constant_evaluated()) {
+      return "Z";
+    }
+    std::array<std::string, 4> cmd{"date", "-d", stamp, "+%z"};
+    subprocess::Popen p{cmd, {.stdout=subprocess::PIPE}};
+    if (p.wait() != 0) {
+      throw std::runtime_error(std::format("date command failed. Invalid date? {}", stamp));
+    }
+    auto result = p.read_stdout_all();
+
+    if (!result.empty() && result.back() == '\n') {
+      result.pop_back();
+    }
+    return result; // string like "+0200"
+  }
+
+// Constexpr Timezone Parser
+
+  // Parses timezone offset from remaining input (e.g., "+02", "+0200")
+  // Supports ±hh, ±hhmm, and ±hh:mm forms
+  constexpr minutes parse_timezone(const auto& rest) {
+    using namespace std::chrono_literals;
+    if (rest.begin() == rest.end()) {
+      throw std::runtime_error(std::format("cannot parse empty timezone"));
+    }
+    if ((*rest.begin()|0x20) == 'z' ) {
+      return 0min;
+    }
+    using namespace std::ranges;
+    const auto first = find_first_of(rest, ":");
+    int cnt = 3;
+    auto h = rest | views::take(3);
+    if (first != rest.end()) {
+      ++cnt;
+    }
+    auto m = rest | views::drop(cnt);
+    auto tz = hours{util::parse_int(std::string{h.begin(), h.end()})};
+    if (m.begin() != m.end()) {
+      minutes min{util::parse_int(std::string{m.begin(), m.end()})};
+
+      if (tz < hours{0}) {
+        return tz - min;
+      }
+      else {
+        return tz + min;
+      }
+    }
+    return tz;
+  }
+
+// Main Timestamp Parser
+// This is the central function. It aims to be fairly flexible, so handles more than just pgsql timestamps. It should
+// handle anything reasonable a user throws at it.
+
+
+  // Parses timestamps like "2025-01-01T01:01:00.000000+0000"
+  // Falls back to `get_timezone` if no offset is provided
+  constexpr system_clock::time_point parse_timestamp(const std::string& stamp) {
+    using namespace std::ranges;
+    constexpr std::array<const time_field, 7> fields {
+      time_field{&time::year, "-", 4},
+      time_field{&time::month, "-", 2},
+      time_field{&time::day, " Tt", 2},
+      time_field{&time::hour, ":", 2},
+      time_field{&time::minute, ":", 2},
+      time_field{&time::second, ".+-Zz", 2},
+      time_field{&time::micro, "+-Zz", 6, true},
+    };
+    time t{};
+    auto parse = [&]<const std::size_t n>(this auto& self, const auto rest) {
+      const auto first = find_first_of(rest, fields[n].separator);
+      bool found (first != rest.end());
+
+      auto pfx = (found ? subrange{rest.begin(), first} : rest) | views::take(fields[n].length);
+
+      std::string car{pfx.begin(), pfx.end()};
+
+      auto cdr = found ? subrange{first, rest.end()} : rest | views::drop(fields[n].length);
+      if constexpr(fields[n].right) {
+        while (car.size() < fields[n].length) {
+          car += "0";
+        }
+      }
+      t.*(fields[n].field) = util::parse_int(car);
+      constexpr std::size_t next = n + 1;
+      if constexpr (next < fields.size()) {
+        int d = found;
+        if constexpr(next > 3) {
+          if (cdr.begin() != cdr.end()) {
+            if (*cdr.begin() == '+' || *cdr.begin() == '-' || (*cdr.begin()|0x20) == 'z') {
+              d = 0;
+            }
+          }
+        }
+        return self.template operator()<next>(cdr | views::drop(d));
+      }
+      else {
+        return cdr;
+      }
+
+    };
+    auto rest = parse.template operator()<std::size_t{0}>(views::all(stamp));
+    sys_days date{year{t.year}/month{static_cast<uint32_t>(t.month)}/day{static_cast<uint32_t>(t.day)}};
+    if (rest.size() == 0) {
+
+      t.timezone = parse_timezone(get_timezone(stamp));
+    }
+    else {
+      t.timezone = parse_timezone(rest);
+    }
+
+    auto tp = date + hours{t.hour} + minutes{t.minute} + seconds{t.second} + microseconds{t.micro};
+
+    return tp - t.timezone;
+  }
+}
+
+// Unit Tests
+
+namespace {
+  using namespace std::chrono;
+  using namespace lpprogramming::util;
+
+  template<class T>
+  concept StringLiteral = requires(T s) {
+    { std::extent_v<std::remove_reference_t<T>> } -> std::convertible_to<std::size_t>;
+    requires std::same_as<std::remove_extent_t<std::remove_reference_t<T>>, char>;
+  };
+
+  consteval auto tp(int y, int m, int d, int h = 0, int min = 0, int s = 0) {
+    sys_days yd{year{y}/m/d};
+    return system_clock::time_point{yd + hours{h} + minutes{min} + seconds{s}};
+  }
+
+  template<size_t T, std::size_t N> requires(N <= T)
+  constexpr std::array<char, T> to_array(const char (&lit)[N]) {
+    std::array<char, T> result{};
+    util::static_for<N>([&]<std::size_t n>(std::integral_constant<std::size_t, n>) {
+        result[n] = lit[n];
+      });
+    return result;
+  }
+
+  // -----------------------------------------------------------------
+  // Test case definition
+  // -----------------------------------------------------------------
+
+  struct test {
+    const std::array<char, 128> label;
+    const system_clock::time_point actual;
+    const system_clock::time_point expected;
+    const size_t label_length;
+
+    template<StringLiteral L, class A, class E>
+    constexpr test(const L& l, const A&& a, const E&& e)
+        : label(to_array<128>(l))
+        , actual(a)
+        , expected(e)
+        , label_length(sizeof(L) - 1) {}
+  };
+
+// Test Cases
+// Compile-time tests. If any of them fail, you'll get a compiler error identifying the test, and what the actual parsed
+// value was. It can only report that as epoch seconds, so you'll need to turn it back into a readable timestamp to figure
+// out the underlying problem. Note the labels are purely informational, and must be no longer than 128 characters.
+
+// Note that there are no negative tests. Everything you test must parse successfully, since parsing failures throw and
+// catching in consteval isn't supported yet by clang.
+
+
+  constexpr std::array tests{
+    test{"test_rfc3339_utc_z", parse_timestamp("2025-11-15T09:08:00Z"), tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_rfc3339_utc_plus", parse_timestamp("2025-11-15T17:08:00+08:00"), tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_rfc3339_utc_minus", parse_timestamp("2025-11-15T09:08:00-00:00"), tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_iso8601_basic", parse_timestamp("20251115T090800Z"), tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_iso8601_extended_no_t", parse_timestamp("2025-11-15 09:08:00Z"), tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_leap_year_feb29", parse_timestamp("2024-02-29T12:00:00Z"), tp(2024, 2, 29, 12, 0, 0)}
+    ,test{"test_min_date", parse_timestamp("1970-01-01T00:00:00Z"), system_clock::time_point{}}
+    ,test{"test_large_year", parse_timestamp("9999-12-31T23:59:59.999Z"),
+          tp(9999, 12, 31, 23, 59, 59) + milliseconds(999)}
+    ,test{"test_negative_offset", parse_timestamp("2025-11-15T01:08:00-08:00"), tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_midnight_rollover", parse_timestamp("2025-11-16T24:00:00Z"), tp(2025, 11, 17, 0, 0, 0)}
+    ,test{"test_positive_offset", parse_timestamp("2025-11-15T09:08:00+00:00"), tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_subsecond_precision", parse_timestamp("2025-11-15T01:08:00.000001Z"),
+          tp(2025, 11, 15, 1, 8, 0) + microseconds{1}}
+    ,test{"test_rfc3339_fractional", parse_timestamp("2025-11-15T09:08:00.123Z"),
+          tp(2025, 11, 15, 9, 8, 0) + milliseconds(123)}
+    ,test{"test_rfc3339_fractional_rounding", parse_timestamp("2025-11-15T09:08:00.999999Z"),
+          tp(2025, 11, 15, 9, 8, 0) + milliseconds(999) + microseconds(999)}
+    ,test{"test_fractional_truncation", parse_timestamp("2025-11-15T09:08:00.123456789Z"),
+          tp(2025, 11, 15, 9, 8, 0) + microseconds(123456)}
+    ,test{"test_fractional_zero", parse_timestamp("2025-11-15T09:08:00.0Z"),
+          tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_fractional_missing_digits", parse_timestamp("2025-11-15T09:08:00.Z"),
+          tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_no_fractional_part", parse_timestamp("2025-11-15T09:08:00Z"),
+          tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_offset_hours_only", parse_timestamp("2025-11-15T17:08:00+08"),
+          tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_max_subsecond", parse_timestamp("2025-11-15T09:08:00.999999999Z"),
+          tp(2025, 11, 15, 9, 8, 0) + microseconds(999999)}
+    ,test{"test_offset_minutes_only", parse_timestamp("2025-11-15T09:30:00+00:30"),
+          tp(2025, 11, 15, 9, 0, 0)}
+    ,test{"test_midnight_24h_basic", parse_timestamp("20251116T240000Z"),
+          tp(2025, 11, 17, 0, 0, 0)}
+    ,test{"test_midnight_24h_extended", parse_timestamp("2025-11-16 24:00:00Z"),
+          tp(2025, 11, 17, 0, 0, 0)}
+    ,test{"test_leap_year_feb28", parse_timestamp("2024-02-28T23:59:59Z"),
+          tp(2024, 2, 28, 23, 59, 59)}
+    ,test{"test_year_0000", parse_timestamp("0000-01-01T00:00:00Z"),
+          tp(0, 1, 1, 0, 0, 0)}
+    ,test{"test_month_00", parse_timestamp("2025-00-01T00:00:00Z"),
+          tp(2024, 12, 1, 0, 0, 0)}
+    ,test{"test_month_13", parse_timestamp("2025-13-01T00:00:00Z"),
+          tp(2026, 1, 1, 0, 0, 0)}
+    ,test{"test_day_00", parse_timestamp("2025-11-00T00:00:00Z"),
+          tp(2025, 10, 31, 0, 0, 0)}
+    ,test{"test_day_overflow", parse_timestamp("2025-11-31T00:00:00Z"),
+          tp(2025, 12, 1, 0, 0, 0)}
+    ,test{"test_hour_24_no_roll", parse_timestamp("2025-11-15T24:00:00+00:00"),
+          tp(2025, 11, 16, 0, 0, 0)}
+    ,test{"test_missing_T_space", parse_timestamp("2025-11-1509:08:00Z"),
+          tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_lower_case_z", parse_timestamp("2025-11-15t09:08:00z"),
+          tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_utc_designator_Z", parse_timestamp("2025-11-15T09:08:00Z"),
+          tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_utc_designator_z", parse_timestamp("2025-11-15T09:08:00z"),
+          tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_trailing_garbage_ignore", parse_timestamp("2025-11-15T09:08:00Z;comment"),
+          tp(2025, 11, 15, 9, 8, 0)}
+    ,test{"test_offset_max", parse_timestamp("2025-11-15T00:00:00+23:59"),
+          tp(2025, 11, 14, 0, 1, 0)}
+    ,test{"test_offset_min", parse_timestamp("2025-11-15T00:00:00-23:59"),
+          tp(2025, 11, 15, 23, 59, 0)}
+  };
+
+  // -----------------------------------------------------------------
+  // Test runner
+  // -----------------------------------------------------------------
+  template <size_t index, auto label, size_t label_length, long a, long e>
+  consteval void test() {
+    static_assert(a == e, std::string_view{label.begin(), label.begin() + label_length});
+  }
+
+  consteval bool run_tests() {
+    constexpr auto tc = tests.size();
+    static_for<tc>([&]<std::size_t n>(std::integral_constant<std::size_t, n>) {
+        test<n,
+             tests[n].label,
+             tests[n].label_length,
+             tests[n].actual.time_since_epoch().count(),
+             tests[n].expected.time_since_epoch().count()>();
+      });
+    return true;
+  }
+
+  static_assert(run_tests());
+}
