@@ -196,6 +196,7 @@ handle anything reasonable a user throws at it.
 #+end_src
 ** Unit Tests
 #+begin_src c++
+#ifndef SKIP_CONSTEXPR_TESTS
 namespace {
   using namespace std::chrono;
   using namespace lpprogramming::util;
@@ -336,6 +337,7 @@ catching in consteval isn't supported yet by clang.
 
   static_assert(run_tests());
 }
+#endif
 #+end_src
 
 
