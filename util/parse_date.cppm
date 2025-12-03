@@ -8,6 +8,7 @@ import <ranges>;
 import <algorithm>;
 import <format>;
 import <type_traits>;
+import <cstdint>;
 
 import Subprocess;
 import parse_int;
