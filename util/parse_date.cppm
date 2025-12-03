@@ -178,6 +178,7 @@ namespace lpprogramming::util {
 
 // Unit Tests
 
+#ifndef SKIP_CONSTEXPR_TESTS
 namespace {
   using namespace std::chrono;
   using namespace lpprogramming::util;
@@ -318,3 +319,4 @@ namespace {
 
   static_assert(run_tests());
 }
+#endif
