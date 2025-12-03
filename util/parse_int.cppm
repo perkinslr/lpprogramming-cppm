@@ -5,6 +5,7 @@ import <string_view>;
 import <stdexcept>;
 import <format>;
 import <algorithm>;
+import <cstdint>;
 
 export
 namespace lpprogramming::util {
