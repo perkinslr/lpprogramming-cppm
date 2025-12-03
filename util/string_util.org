@@ -1,0 +1,41 @@
+* string_util - module providing constexpr compatible string utilities
+string_concat is just a shortcut for joining strings with an empty separator.
+
+iter_replace is used to replace each occurance of sep in the source string with the results of func(). This lets you
+implement uniform replacements by using a trivial lambda, while also letting you use fancier replacements like counters.
+
+#+begin_src c++ :tangle string_util.cppm
+export module string_util;
+import <string>;
+import <algorithm>;
+import <ranges>;
+import <functional>;
+import <vector>;
+
+export
+namespace lpprogramming::util {
+  inline constexpr std::string string_concat(const std::vector<std::string> &in) {
+    if (in.size() < 1) {
+      return "";
+    }
+    return std::ranges::fold_left(std::views::drop(in, 1), in[0], std::plus<>());
+  }
+  inline constexpr std::string iter_replace(const std::string_view query, const auto& sep, const auto& func) {
+    auto parts = std::views::split(query, std::string{sep}) 
+      | std::ranges::to<std::vector<std::string>>();
+    
+    if (parts.size() == 0) {
+      return std::string{""};
+    }
+
+    return std::ranges::fold_left
+      (
+       parts | std::ranges::views::drop(1),
+       parts[0],
+       func
+       );
+    
+  }
+}
+
+#+end_src

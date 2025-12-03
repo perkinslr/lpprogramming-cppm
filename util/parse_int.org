@@ -1,0 +1,76 @@
+* parse_int - C++ Module for parsing ints in a constexpr context.
+Similar to python's ~int()~ parsing, though there are some differnces. Notably, empty input gives a 0, multiple sign 
+prefixes are correctly handled like standard math, and space, underscore, and single-quote are all allowed as digit
+separators. It isn't the fastest, so at runtime you're probably better with other options in hot paths.
+
+This uses the classic base-conversion algorithm, where each digit multiplies by the source base, then adds the new
+digit. It would be pretty easy to extend this to support other bases via a template.
+
+
+#+begin_src c++ :tangle parse_int.cppm 
+export module parse_int;
+
+import <ranges>;
+import <string_view>;
+import <stdexcept>;
+import <format>;
+import <algorithm>;
+
+export
+namespace lpprogramming::util {
+  constexpr int parse_int(std::string_view s) {
+    int sign = 1;
+    bool past_prefix = false;
+#+end_src
+** transform
+First step is to turn digits into their underlying value. We can encode skipping a step by storing -1. Yes,
+~std::optional~ would be cleaner, but this all fits on one screen, and optional is pretty heavyweight in this simple of
+a case. Note that + and - are only allowed before the first digit, so ~+12-3~ will throw, which breaks constexpr
+contexts. C++26 probably will support catching that, eventually.
+#+begin_src c++ :tangle parse_int.cppm 
+
+    auto digits = s | std::views::transform
+      ([&](char c) constexpr mutable {
+        switch(c) {
+        case '-':
+          sign = -sign;
+        case '+':
+          if (past_prefix) {
+            throw std::runtime_error(std::format("invalid digit past prefix: {}", s));
+          }
+        case ' ':
+        case '_':
+        case '\'':
+          return -1;
+        }
+        if (c < '0' || c > '9') {
+          throw std::runtime_error(std::format("invalid digit: {}", c));
+        }
+        past_prefix = true;
+        return c - '0';
+      });
+#+end_src
+** accumulate
+After the data is transformed, we compute the total, skipping over any -1. We could use a filter, but it's easy enough
+to just drop them from inside the fold.
+#+begin_src c++ :tangle parse_int.cppm 
+    int64_t value = std::ranges::fold_left
+      (digits, 0,
+       [](int64_t acc, const int d) {
+         if (d == -1) {
+           return acc;
+         }
+         
+         acc = acc * 10 + d;
+         if (acc > std::numeric_limits<int>::max()) {
+           throw std::runtime_error("Number too large to fit in int");
+         }
+         return acc;
+
+       });
+    return sign * static_cast<int>(value);
+  }
+}
+
+
+#+end_src

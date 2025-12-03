@@ -1,0 +1,271 @@
+* Subprocess
+This is icky low level C code, but there isn't a good way around it. SyscallHelper ensures each syscall either works,
+or throws runtime exceptions. We don't try to catch them, as if any of these syscalls fail, there's nothing sensible to
+do at this layer. In most cases, you're headed for an application exit at that point, since something is seriously
+wrong. The exception is the ~SyscallOnce~ call, but we let our caller handle that gracefully.
+
+#+begin_src c++ :tangle Subprocess.cppm
+
+export module Subprocess;
+import <unistd.h>;
+import <sys/wait.h>;
+import <fcntl.h>;
+import <cstring>;
+import <vector>;
+import <string>;
+import <span>;
+import <memory>;
+import <print>;
+import <optional>;
+import <array>;
+import <source_location>;
+
+import SyscallHelper;
+
+using lpprogramming::SyscallHelper::Syscall;
+#define SyscallOnce Syscall<false>
+
+export
+namespace lpprogramming::subprocess {
+  struct PopenArgs {
+    std::optional<int> stdin = std::nullopt;
+    std::optional<int> stdout = std::nullopt;
+    std::optional<int> stderr = std::nullopt;
+  };
+  constexpr int PIPE{-1};
+
+  class Popen {
+    static constexpr int NONE{-2};
+    pid_t pid = -1;
+    std::array<int, 3> fds{NONE, NONE, NONE};
+    
+
+  public:
+#+end_src
+** Popen
+The aim here is to follow python's ~subprocess.Popen~ design. So we take an array of string arguments, and up to 3
+optional args for stdin, stdout, and stderr. If those are provided the flag value -1, then we create a new pipe for that
+fd and use it. If they are not specified, we leave that number alone. If they are > -1, then after forking we rebind it
+via ~dup2~ to the correct fd number.
+
+This means we always need enough stack space for up to 6 fd ints. It isn't worth using malloc, so we use 3 arrays.
+
+#+begin_src c++ :tangle Subprocess.cppm
+
+    Popen(std::span<const std::string> args,
+          const PopenArgs flags
+          ) {
+      auto stdin = flags.stdin;
+      auto stdout = flags.stdout;
+      auto stderr = flags.stderr;
+      const std::string& program = args[0];
+      std::array<int, 2> pipe_in {};
+      std::array<int, 2> pipe_out {};
+      std::array<int, 2> pipe_err {};
+
+      if (stdin) {
+        int in = stdin.value();
+        if (in == PIPE) {
+          Syscall(pipe, {"pipe() failed"}, pipe_in.data());
+        }
+      }
+      if (stdout) {
+        int out = stdout.value();
+        if (out == PIPE) {
+          Syscall(pipe, {"pipe() failed"}, pipe_out.data());
+        }
+      }
+      if (stderr) {
+        int err = stderr.value();
+        if (err == PIPE) {
+          Syscall(pipe, {"pipe() failed"}, pipe_err.data());
+        }
+      }
+
+      pid = Syscall(fork, {"fork() failed"});
+
+#+end_src
+*** Child Side
+If the pid is 0, it means this is the child. The parent has the pid set to the new pid. So we need to clean up the
+parent's ends of each managed pipe. Then we many need to move our stdin/out/err to the correct file numbers. If we moved
+them, then we close the original passed fd.  This probably could be a ~static_for~ loop, but it's short enough I think
+the overhead from setting that up would be a wash.
+
+#+begin_src c++ :tangle Subprocess.cppm
+      if (pid == 0) {
+        if (stdin) {
+          int in = stdin.value();
+          if (in == PIPE) {
+            in = pipe_in[0];
+            Syscall(close, {"close() failed"}, pipe_in[1]);
+          }
+          if (in != 0) {
+            Syscall(dup2, {"dup2() failed"}, in, 0);
+            Syscall(close, {"close() failed"}, in);
+          }
+        }
+        if (stdout) {
+          int out = stdout.value();
+          if (out == PIPE) {
+            out = pipe_out[1];
+            Syscall(close, {"close() failed"}, pipe_out[0]);
+          }
+          if (out != 1) {
+            Syscall(dup2, {"dup2() failed"}, out, 1);
+            Syscall(close, {"close() failed"}, out);
+          }
+        }
+        if (stderr) {
+          int err = stderr.value();
+          if (err == PIPE) {
+            err = pipe_err[1];
+            Syscall(close, {"close() failed"}, pipe_err[0]);
+          }
+          if (err != 2) {
+            Syscall(dup2, {"dup2() failed"}, err, 2);
+            Syscall(close, {"close() failed"}, err);
+          }
+        }
+#+end_src
+*** Child Side Exec
+
+With I/O mapped and cleaned up, we exec.
+**** TODO execvpe
+To better follow python's design, this should be ~execvpe~ with an optional environment provided by the caller.
+
+
+#+begin_src c++ :tangle Subprocess.cppm
+
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 1);
+        for (const auto& arg : args) {
+          argv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        execvp(program.c_str(), argv.data());
+        _exit(127);
+      }
+#+end_src
+*** Parent Side
+The child never reaches here. ~execvp~ is normally ~noreturn~, except on some errors. In that case, ~_exit~ is also
+~noreturn~.
+
+On the parent side, we do the opposite cleanup, which is simply closing the child's end of any pipes we made. We also
+move the fds into the permanent fd record so it's accessible after the constructor finishes. If we didn't make a managed
+pipe, either because the child is supposed to use our IO, or because our caller set up their own pipes, then we don't
+allow access to that part.
+
+#+begin_src c++ :tangle Subprocess.cppm
+
+
+      if (stdin) {
+        int in = stdin.value();
+        if (in == PIPE) {
+          fds[0] = pipe_in[1];
+          Syscall(close, {"close() failed"}, pipe_in[0]);
+        }
+      }
+      if (stdout) {
+        int out = stdout.value();
+        if (out == PIPE) {
+          fds[1] = pipe_out[0];
+          Syscall(close, {"close() failed"}, pipe_out[1]);
+        }
+      }
+      if (stderr) {
+        int err = stderr.value();
+        if (err == PIPE) {
+          fds[2] = pipe_err[0];
+          Syscall(close, {"close() failed"}, pipe_err[1]);
+        }
+      }
+    }
+
+    Popen(const Popen&) = delete;
+    Popen& operator=(const Popen&) = delete;
+
+    Popen(Popen&& other) = delete;
+
+    Popen& operator=(Popen&& other) = delete;
+    std::string read_stdout() {
+      if (fds[1] > PIPE) {
+        std::array<char, 128> buf{};
+        ssize_t r = SyscallOnce(read, {"read() failed"}, fds[1], buf.data(), buf.size());
+        return std::string{buf.begin(), buf.begin() + r};
+      }
+      else {
+        throw std::runtime_error{"cannot read from non-pipe stdout"};
+      }
+    }
+#+end_src
+*** TODO Reader / Writer Support
+At some point, I'll need to make a file reader/writer, wrapping libc's ~read~ / ~write~ / ~close~ calls, again mimicking
+python's APIs. At that point, the fds will get passed to /that/ to manage, which would allow the much better
+~p.stdout.read()~ syntax. It also would abstract away from the lack of writer for ~stdin~ and the lack of access to
+~stderr~. In the mean time, there are two helper functions that perform either partial or full ~stdout~ reads, which is
+good enough for the moment.
+#+begin_src c++ :tangle Subprocess.cppm
+    std::string read_stdout_all() {
+      std::println("fd: {}", fds[1]);
+      if (fds[1] > PIPE) {
+        std::string out{};
+        std::array<char, 128> buf{};
+        for (;;) {
+          ssize_t r = Syscall(read, {"read() failed"}, fds[1], buf.data(), buf.size());
+          if (!r) {
+            return out;
+          }
+          out.append(buf.begin(), buf.begin() + r);
+        }
+        return out;
+      }
+      else {
+        throw std::runtime_error{"cannot read from non-pipe stdout"};
+      }
+    }
+#+end_src
+*** ~Poll~ / ~Wait~
+Once again following python's lead, this lets the caller check if the child is done, or wait for it to be done.
+**** TODO Timeout in Wait
+Currently, if the caller needs to wait on the child, but also needs to run other work, the only option is to busy wait.
+
+#+begin_src c++ :tangle Subprocess.cppm
+
+    std::optional<int> poll() {
+      int status;
+      pid_t r = Syscall(waitpid, {"waitpid(WNOHANG) failed"}, pid, &status, WNOHANG);
+      if (r > 0) {
+        if (WIFEXITED(status)) {
+          return WEXITSTATUS(status);
+        }
+        else if (WIFSIGNALED(status)) {
+          return -WTERMSIG(status);
+        }
+        else {
+          throw std::runtime_error{std::format("unrecognized exit: {}", status)};
+        }
+      }
+      else {
+        return std::nullopt;
+      }
+    }
+
+    int wait() {
+      int status;
+      Syscall(waitpid, {"waitpid() failed"}, pid, &status, 0);
+      if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+      }
+      else if (WIFSIGNALED(status)) {
+        return -WTERMSIG(status);
+      }
+      else {
+        throw std::runtime_error{std::format("unrecognized exit: {}", status)};
+      }
+    }
+  };
+
+}
+
+#+end_src

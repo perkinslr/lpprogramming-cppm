@@ -1,0 +1,32 @@
+* static_for - compile-time for-loop over a constexpr number of iterations.
+This largely matches the canonical implementation of static_for used in modern C++ projects. If you've ever done
+~syntax-case~ or ~define-syntax~ in scheme, the concept isn't /too/ hard to grok. It's just kinda gnarly.
+
+The core difficulty is the public-facing (~export~) static_for calls the implementation with (sequence, f), while
+the template args are F, Seq. This is because some compilers don't like packed arguments other than in the last
+position. Just ignore it, it's all deduced instead of explicit anyway.
+
+Bottom line is the exported function takes a template parameter specifying the number of times to run, and a callable.
+It uses ~make_index_sequence~ to turn that into a sequence pack, and passes the whole thing to the non-public version.
+/That/ then unrolls the pack, once per index, starting at 0. If it fails to compile, the compile-time errors will often
+show up right-to-left, starting at the highest error index.
+
+#+begin_src c++ :tangle static_for.cppm
+export module static_for;
+import <utility>;
+import <print>;
+namespace lpprogramming::util {
+  template <typename F, std::size_t... Is>
+  constexpr void static_for(std::index_sequence<Is...>, F&& f) {
+    (f(std::integral_constant<std::size_t, Is>{}), ...);
+  }
+
+  export
+  template <std::size_t N, typename F>
+  constexpr void static_for(F&& f) {
+    static_for(std::make_index_sequence<N>{}, std::forward<F>(f));
+  }
+}
+#+end_src
+
+
