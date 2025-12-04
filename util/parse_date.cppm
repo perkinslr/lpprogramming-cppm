@@ -14,7 +14,6 @@ import Subprocess;
 import parse_int;
 import static_for;
 
-using namespace std::chrono;
 using namespace lpprogramming;
 
 // Internal Data Structures
@@ -24,7 +23,7 @@ using namespace lpprogramming;
 // bit of performance out of it.
 
 namespace {
-  struct time {
+  struct temp_time {
     int32_t year;
     int32_t month;
     int32_t day;
@@ -32,11 +31,11 @@ namespace {
     int32_t minute;
     int32_t second;
     int32_t micro;
-    minutes timezone;
+    std::chrono::minutes timezone;
   };
 
   struct time_field {
-    int32_t time::* field;
+    int32_t temp_time::* field;
     std::string separator;
     int32_t length;
     bool right = false;
@@ -45,6 +44,7 @@ namespace {
 
 export
 namespace lpprogramming::util {
+  using namespace std::chrono;
 
 // External Timezone Lookup via ~date~ Command
 // Clang doesn't have proper timezone handling yet. We could fall back on libc to figure out our time offset, but we need
@@ -119,15 +119,15 @@ namespace lpprogramming::util {
   constexpr system_clock::time_point parse_timestamp(const std::string& stamp) {
     using namespace std::ranges;
     constexpr std::array<const time_field, 7> fields {
-      time_field{&time::year, "-", 4},
-      time_field{&time::month, "-", 2},
-      time_field{&time::day, " Tt", 2},
-      time_field{&time::hour, ":", 2},
-      time_field{&time::minute, ":", 2},
-      time_field{&time::second, ".+-Zz", 2},
-      time_field{&time::micro, "+-Zz", 6, true},
+      time_field{&temp_time::year, "-", 4},
+      time_field{&temp_time::month, "-", 2},
+      time_field{&temp_time::day, " Tt", 2},
+      time_field{&temp_time::hour, ":", 2},
+      time_field{&temp_time::minute, ":", 2},
+      time_field{&temp_time::second, ".+-Zz", 2},
+      time_field{&temp_time::micro, "+-Zz", 6, true},
     };
-    time t{};
+    temp_time t{};
     auto parse = [&]<const std::size_t n>(this auto& self, const auto rest) {
       const auto first = find_first_of(rest, fields[n].separator);
       bool found (first != rest.end());
